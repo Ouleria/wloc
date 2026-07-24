@@ -1,0 +1,4 @@
+# Cloudflare 一键部署会要求填写这两个 Secret。
+# 这里只能保留示例；绝对不要把真实值提交到 GitHub。
+METEOMATICS_ICS_URL="webcal://ical.meteomatics.com/calendar/请粘贴你的完整订阅链接"
+ACCESS_TOKEN="请换成至少32位随机密码"
