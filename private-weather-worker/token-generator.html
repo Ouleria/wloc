@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="zh-Hans">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>本地随机密码生成器</title>
+<style>body{font-family:-apple-system,BlinkMacSystemFont,"PingFang SC",sans-serif;max-width:720px;margin:40px auto;padding:0 20px;line-height:1.7}textarea,button{width:100%;font:inherit;padding:12px;box-sizing:border-box}textarea{min-height:100px}button{margin-top:12px}</style>
+</head>
+<body>
+<h1>本地随机密码生成器</h1>
+<p>这个页面不联网。点击按钮生成 64 位随机密码，然后复制到 Cloudflare 的 <code>ACCESS_TOKEN</code> Secret。</p>
+<textarea id="output" readonly></textarea>
+<button id="generate">生成并复制</button>
+<script>
+function makeToken(){const bytes=new Uint8Array(32);crypto.getRandomValues(bytes);return Array.from(bytes,b=>b.toString(16).padStart(2,'0')).join('')}
+async function run(){const token=makeToken();document.getElementById('output').value=token;try{await navigator.clipboard.writeText(token);document.getElementById('generate').textContent='已生成并复制'}catch{document.getElementById('generate').textContent='已生成，请手动复制'}}
+document.getElementById('generate').addEventListener('click',run);run();
+</script>
+</body>
+</html>
