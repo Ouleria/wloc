@@ -1,0 +1,28 @@
+{
+  "name": "private-weather-worker",
+  "version": "2.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev",
+    "check": "wrangler deploy --dry-run",
+    "test": "node --test"
+  },
+  "devDependencies": {
+    "wrangler": "4.114.0"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "cloudflare": {
+    "bindings": {
+      "METEOMATICS_ICS_URL": {
+        "description": "粘贴 Meteomatics 生成的完整 `webcal://...` 天气日历订阅地址。它包含住址和坐标，只能填在这里，**不要提交到 GitHub**。"
+      },
+      "ACCESS_TOKEN": {
+        "description": "设置至少 32 位的随机私人密码。网页和 iPhone 捷径都用这个密码访问天气。"
+      }
+    }
+  }
+}
