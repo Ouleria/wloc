@@ -1,0 +1,22 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "private-weather-worker",
+  "main": "src/index.js",
+  "compatibility_date": "2026-07-25",
+  "workers_dev": true,
+  "cache": {
+    "enabled": false
+  },
+  "observability": {
+    "enabled": false
+  },
+  "secrets": {
+    "required": [
+      "METEOMATICS_ICS_URL",
+      "ACCESS_TOKEN"
+    ]
+  },
+  "vars": {
+    "TIME_ZONE": "Asia/Taipei"
+  }
+}
