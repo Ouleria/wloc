@@ -1,580 +1,202 @@
-const DEFAULT_TIME_ZONE = "Asia/Taipei";
-const PAGE_TITLE = "私人天气";
-const WEATHER_TITLE = "〖 菜菜今天天气啦喂 〗";
+import {
+  APP_CONFIG,
+  WEATHER_LIMITS,
+  WEEKDAY_TEXT,
+  WEATHER_TEXT,
+  SUMMER_HOLIDAY,
+  CHINESE_NEW_YEAR_DAY_1,
+} from './config.js';
+
 const MAX_ICS_BYTES = 1_000_000;
-const MAX_EVENTS = 200;
-const MAX_OUTPUT_CHARS = 12_000;
 const MIN_TOKEN_LENGTH = 32;
+const MAX_OUTPUT_CHARS = 16_000;
 
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
-
-    if (request.method === "OPTIONS") {
-      return new Response(null, {
-        status: 204,
-        headers: securityHeaders({
-          Allow: "GET, HEAD, OPTIONS",
-        }),
-      });
-    }
-
-    if (request.method !== "GET" && request.method !== "HEAD") {
-      return textResponse("只允许 GET 请求。", 405, {
-        Allow: "GET, HEAD, OPTIONS",
-      });
-    }
-
+    if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: securityHeaders({ Allow: 'GET, HEAD, OPTIONS' }) });
+    if (!['GET', 'HEAD'].includes(request.method)) return textResponse('只允许 GET 请求。', 405, { Allow: 'GET, HEAD, OPTIONS' });
     try {
       let response;
-
-      if (url.pathname === "/" || url.pathname === "/index.html") {
-        response = htmlResponse(renderPrivatePage());
-      } else if (url.pathname === "/health") {
-        response = textResponse("ok", 200);
-      } else if (url.pathname === "/robots.txt") {
-        response = textResponse("User-agent: *\nDisallow: /\n", 200);
-      } else if (url.pathname === "/favicon.ico") {
-        response = new Response(null, {
-          status: 204,
-          headers: securityHeaders(),
-        });
-      } else if (url.pathname === "/api/today") {
-        if (!isAuthorized(request, env.ACCESS_TOKEN)) {
-          response = textResponse("未授权：请输入正确的私人访问密码。", 401, {
-            "WWW-Authenticate": 'Bearer realm="Private Weather"',
-            Vary: "Authorization",
-          });
-        } else {
-          const weatherText = await getTodayWeather(env);
-          response = textResponse(weatherText, 200, {
-            Vary: "Authorization",
-          });
-        }
-      } else {
-        response = textResponse("Not Found", 404);
-      }
-
-      return request.method === "HEAD" ? responseWithoutBody(response) : response;
+      if (url.pathname === '/health') response = textResponse('ok');
+      else if (url.pathname === '/robots.txt') response = textResponse('User-agent: *\nDisallow: /\n');
+      else if (url.pathname === '/favicon.ico') response = new Response(null, { status: 204, headers: securityHeaders() });
+      else if (['/', '/daily', '/weather', '/index.html'].includes(url.pathname)) response = htmlResponse(renderPrivatePage(url.pathname === '/weather' ? 'weather' : 'daily'));
+      else if (url.pathname === '/api/weather' || url.pathname === '/api/today') {
+        requireAuthorization(request, env.ACCESS_TOKEN);
+        response = textResponse(buildWeatherText(await buildWeatherResult(env, url.searchParams.get('date'))));
+      } else if (url.pathname === '/api/daily') {
+        requireAuthorization(request, env.ACCESS_TOKEN);
+        response = textResponse(buildDailyText(await buildWeatherResult(env, url.searchParams.get('date'))));
+      } else if (url.pathname === '/api/preview') {
+        requireAuthorization(request, env.ACCESS_TOKEN);
+        response = jsonResponse(buildPreviewSamples());
+      } else response = textResponse('Not Found', 404);
+      return request.method === 'HEAD' ? responseWithoutBody(response) : response;
     } catch (error) {
-      // 不记录或回显订阅 URL、地址、经纬度、访问密码和上游响应正文。
-      const response = textResponse(`天气获取失败：${safeErrorMessage(error)}`, 502, {
-        Vary: "Authorization",
-      });
-      return request.method === "HEAD" ? responseWithoutBody(response) : response;
+      const status = error && error.status ? error.status : 502;
+      const response = textResponse(`获取失败：${safeErrorMessage(error)}`, status, { Vary: 'Authorization' });
+      return request.method === 'HEAD' ? responseWithoutBody(response) : response;
     }
   },
 };
 
-function isAuthorized(request, expectedToken) {
-  const expected = String(expectedToken || "");
-  if (expected.length < MIN_TOKEN_LENGTH) return false;
-
-  const authorization = request.headers.get("Authorization") || "";
-  const provided = authorization.startsWith("Bearer ")
-    ? authorization.slice("Bearer ".length)
-    : "";
-
-  return constantTimeEqual(provided, expected);
+function requireAuthorization(request, expectedToken) {
+  const expected = String(expectedToken || '');
+  if (expected.length < MIN_TOKEN_LENGTH) throw httpError(503, '尚未正确设置 ACCESS_TOKEN Secret（至少32位）');
+  const authorization = request.headers.get('Authorization') || '';
+  const provided = authorization.startsWith('Bearer ') ? authorization.slice(7) : '';
+  if (!constantTimeEqual(provided, expected)) throw httpError(401, '未授权：访问密码不正确');
 }
-
 function constantTimeEqual(a, b) {
   const left = new TextEncoder().encode(String(a));
   const right = new TextEncoder().encode(String(b));
   const length = Math.max(left.length, right.length);
   let diff = left.length ^ right.length;
-
-  for (let i = 0; i < length; i += 1) {
-    diff |= (left[i] || 0) ^ (right[i] || 0);
-  }
-
+  for (let i = 0; i < length; i += 1) diff |= (left[i] || 0) ^ (right[i] || 0);
   return diff === 0;
 }
 
-async function getTodayWeather(env) {
-  const sourceUrl = normalizeAndValidateSourceUrl(env.METEOMATICS_ICS_URL);
-  const timeZone = normalizeTimeZone(env.TIME_ZONE || DEFAULT_TIME_ZONE);
-
+async function buildWeatherResult(env, dateOverride) {
+  const timeZone = normalizeTimeZone(env.TIME_ZONE || APP_CONFIG.timeZone);
+  const now = resolveNow(dateOverride);
+  const sourceUrl = normalizeSourceUrl(env.METEOMATICS_ICS_URL);
   const upstream = await fetch(sourceUrl, {
-    method: "GET",
-    redirect: "follow",
-    cache: "no-store",
-    headers: {
-      Accept: "text/calendar, text/plain;q=0.9, */*;q=0.8",
-      "User-Agent": "PrivateWeatherWorker/2.0",
-    },
+    redirect: 'follow', cache: 'no-store',
+    headers: { Accept: 'text/calendar,text/plain;q=0.9,*/*;q=0.8', 'User-Agent': 'CaiPrivateWeather/3.0' },
   });
-
-  if (!upstream.ok) {
-    throw new Error(`天气订阅服务器返回 ${upstream.status}`);
-  }
-
-  const declaredLength = Number(upstream.headers.get("Content-Length") || 0);
-  if (declaredLength > MAX_ICS_BYTES) {
-    throw new Error("天气订阅内容过大，已停止读取");
-  }
-
-  const icsText = await upstream.text();
-  if (new TextEncoder().encode(icsText).byteLength > MAX_ICS_BYTES) {
-    throw new Error("天气订阅内容过大，已停止读取");
-  }
-
-  if (!/BEGIN:VCALENDAR/i.test(icsText)) {
-    throw new Error("订阅内容不是有效的 iCalendar 数据");
-  }
-
-  const events = parseIcsEvents(icsText);
-  if (events.length === 0) {
-    throw new Error("订阅中没有找到天气事件");
-  }
-
-  const todayKey = formatDateKey(new Date(), timeZone);
-  const todayEvents = events
-    .filter((event) => eventDateKey(event.dtstart, timeZone) === todayKey)
-    .sort((a, b) =>
-      sortableDateValue(a.dtstart).localeCompare(sortableDateValue(b.dtstart)),
-    );
-
-  if (todayEvents.length === 0) {
-    throw new Error(`没有找到 ${todayKey} 的天气预报，稍后再试`);
-  }
-
-  const sensitiveFragments = sourceSensitiveFragments(sourceUrl);
-  const weatherBody = buildWeatherBody(todayEvents, sensitiveFragments);
-  if (!weatherBody) {
-    throw new Error("找到今天的事件，但没有可安全显示的天气文字");
-  }
-
-  return `${WEATHER_TITLE}\n${todayKey}\n\n${weatherBody}`.slice(
-    0,
-    MAX_OUTPUT_CHARS,
-  );
+  if (!upstream.ok) throw new Error(`天气订阅服务器返回 ${upstream.status}`);
+  const length = Number(upstream.headers.get('Content-Length') || 0);
+  if (length > MAX_ICS_BYTES) throw new Error('天气订阅内容过大，已停止读取');
+  const raw = await upstream.text();
+  if (new TextEncoder().encode(raw).byteLength > MAX_ICS_BYTES) throw new Error('天气订阅内容过大，已停止读取');
+  const dateKey = formatDateKey(now, timeZone);
+  const weatherSource = extractTodayWeatherText(redactSourceSecrets(raw, sourceUrl), dateKey, timeZone);
+  const slots = parseWeatherSlots(weatherSource);
+  if (!slots.length) throw new Error('没有识别到8段天气，请把错误页面截图发来检查（不要截图Secret）');
+  return { now, timeZone, dateKey, slots, analysis: analyzeWeather(slots), holiday: getHolidayState(now, timeZone) };
 }
 
-function normalizeAndValidateSourceUrl(value) {
-  if (!value) throw new Error("尚未设置 METEOMATICS_ICS_URL Secret");
-
-  const normalized = String(value).trim().replace(/^webcal:/i, "https:");
+function normalizeSourceUrl(value) {
+  if (!value) throw new Error('尚未设置 METEOMATICS_ICS_URL Secret');
+  const normalized = String(value).trim().replace(/^webcal:/i, 'https:');
   let url;
-
-  try {
-    url = new URL(normalized);
-  } catch {
-    throw new Error("天气订阅地址格式不正确");
-  }
-
-  if (
-    url.protocol !== "https:" ||
-    url.hostname.toLowerCase() !== "ical.meteomatics.com" ||
-    !url.pathname.startsWith("/calendar/")
-  ) {
-    throw new Error("天气订阅地址必须来自 ical.meteomatics.com/calendar/");
-  }
-
-  if (url.username || url.password) {
-    throw new Error("天气订阅地址不能包含账号或密码");
-  }
-
-  url.hash = "";
+  try { url = new URL(normalized); } catch { throw new Error('天气订阅地址格式不正确'); }
+  if (url.protocol !== 'https:' || url.hostname.toLowerCase() !== 'ical.meteomatics.com' || !url.pathname.startsWith('/calendar/')) throw new Error('天气订阅地址必须来自 ical.meteomatics.com/calendar/');
+  url.hash = '';
   return url;
 }
-
-function normalizeTimeZone(value) {
-  const timeZone = String(value || DEFAULT_TIME_ZONE).trim();
-  try {
-    new Intl.DateTimeFormat("en-CA", { timeZone }).format(new Date());
-    return timeZone;
-  } catch {
-    throw new Error("TIME_ZONE 时区设置不正确");
-  }
-}
-
-function sourceSensitiveFragments(sourceUrl) {
-  const segments = sourceUrl.pathname.split("/").filter(Boolean);
-  const fragments = new Set();
-
-  for (const segment of segments.slice(1, 3)) {
-    let decoded = segment;
-    try {
-      decoded = decodeURIComponent(segment);
-    } catch {
-      // 保留原字符串，后续仍会做坐标和地址格式过滤。
-    }
-
-    if (decoded.length >= 4) fragments.add(decoded);
-    if (segment.length >= 4) fragments.add(segment);
-
-    if (/^-?\d+(?:\.\d+)?_-?\d+(?:\.\d+)?$/.test(decoded)) {
-      fragments.add(decoded.replace("_", ","));
-      fragments.add(decoded.replace("_", ", "));
-      fragments.add(decoded.replace("_", " "));
-    }
-  }
-
-  return [...fragments].sort((a, b) => b.length - a.length);
-}
-
-function parseIcsEvents(icsText) {
-  const unfolded = String(icsText).replace(/\r?\n[ \t]/g, "");
+function extractTodayWeatherText(raw, dateKey, timeZone) {
+  if (!/BEGIN:VCALENDAR/i.test(raw)) return raw;
+  const unfolded = raw.replace(/\r?\n[ \t]/g, '');
   const blocks = unfolded.match(/BEGIN:VEVENT[\s\S]*?END:VEVENT/gi) || [];
-
-  return blocks.slice(0, MAX_EVENTS).flatMap((block) => {
-    const event = {
-      dtstart: "",
-      dtend: "",
-      summary: "",
-      description: "",
-    };
-
-    for (const line of block.split(/\r?\n/)) {
-      const colon = line.indexOf(":");
-      if (colon < 0) continue;
-
-      const rawKey = line.slice(0, colon);
-      const value = line.slice(colon + 1);
-      const key = rawKey.split(";", 1)[0].toUpperCase();
-
-      if (key === "DTSTART") event.dtstart = value.trim();
-      if (key === "DTEND") event.dtend = value.trim();
-      if (key === "SUMMARY") event.summary = decodeIcsText(value);
-      if (key === "DESCRIPTION") event.description = decodeIcsText(value);
-    }
-
-    return event.dtstart ? [event] : [];
-  });
-}
-
-function decodeIcsText(value) {
-  return String(value)
-    .replace(/\\[nN]/g, "\n")
-    .replace(/\\,/g, ",")
-    .replace(/\\;/g, ";")
-    .replace(/\\\\/g, "\\")
-    .trim();
-}
-
-function eventDateKey(rawValue, timeZone) {
-  const raw = String(rawValue || "").trim();
-
-  if (/^\d{8}$/.test(raw)) {
-    return compactDateToKey(raw);
-  }
-
-  const match = raw.match(/^(\d{8})T(\d{4}(?:\d{2})?)(Z|[+-]\d{4})?$/);
-  if (!match) return "";
-
-  const [, datePart, timePart, suffix] = match;
-  if (!suffix) return compactDateToKey(datePart);
-
-  const hh = timePart.slice(0, 2);
-  const mm = timePart.slice(2, 4);
-  const ss = timePart.slice(4, 6) || "00";
-  const zone =
-    suffix === "Z"
-      ? "Z"
-      : `${suffix.slice(0, 3)}:${suffix.slice(3, 5)}`;
-  const iso = `${compactDateToKey(datePart)}T${hh}:${mm}:${ss}${zone}`;
-  const parsed = new Date(iso);
-
-  return Number.isNaN(parsed.getTime()) ? "" : formatDateKey(parsed, timeZone);
-}
-
-function compactDateToKey(raw) {
-  return `${raw.slice(0, 4)}-${raw.slice(4, 6)}-${raw.slice(6, 8)}`;
-}
-
-function sortableDateValue(rawValue) {
-  return String(rawValue || "");
-}
-
-function formatDateKey(date, timeZone) {
-  const parts = new Intl.DateTimeFormat("en-CA", {
-    timeZone,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-  }).formatToParts(date);
-  const map = Object.fromEntries(parts.map((part) => [part.type, part.value]));
-  return `${map.year}-${map.month}-${map.day}`;
-}
-
-function buildWeatherBody(events, sensitiveFragments) {
   const chunks = [];
-
-  for (const event of events) {
-    const description = sanitizeWeatherText(
-      event.description,
-      sensitiveFragments,
-    );
-    const summary = sanitizeWeatherText(event.summary, sensitiveFragments);
-
-    if (description) {
-      chunks.push(description);
-    } else if (summary) {
-      chunks.push(summary);
+  for (const block of blocks.slice(0, 300)) {
+    const fields = parseIcsBlock(block);
+    if (eventDateKey(fields.DTSTART || '', timeZone) === dateKey) chunks.push([fields.SUMMARY, fields.DESCRIPTION].filter(Boolean).join('\n'));
+  }
+  if (!chunks.length) {
+    for (const block of blocks.slice(0, 300)) {
+      const fields = parseIcsBlock(block);
+      const text = [fields.SUMMARY, fields.DESCRIPTION].filter(Boolean).join('\n');
+      if (text.includes(dateKey) || text.includes(dateKey.replaceAll('-', ''))) chunks.push(text);
     }
   }
-
-  return dedupeLines(chunks.join("\n"));
+  return chunks.join('\n');
 }
-
-function sanitizeWeatherText(text, sensitiveFragments) {
-  const lines = String(text || "")
-    .replace(/\r/g, "")
-    .split("\n")
-    .map((line) => redactSensitiveFragments(line, sensitiveFragments))
-    .map((line) => line.trim())
-    .filter(Boolean)
-    .filter(
-      (line) =>
-        !/^(?:location|geo|address|地址|位置|地點|地点)\s*[:：]/i.test(line),
-    )
-    .filter(
-      (line) =>
-        !/(?:meteomatics|forecast\s+by|weather\s+calendar)/i.test(line),
-    )
-    .filter((line) => !/(?:https?|webcal):\/\//i.test(line))
-    .filter((line) => !containsCoordinate(line))
-    .filter((line) => !looksLikeStreetAddress(line))
-    .map((line) => line.replace(/\s{2,}/g, " ").trim())
-    .filter(Boolean);
-
-  return lines.join("\n");
-}
-
-function redactSensitiveFragments(line, sensitiveFragments) {
-  let result = String(line);
-
-  for (const fragment of sensitiveFragments) {
-    if (!fragment) continue;
-    result = result.split(fragment).join("[位置已隐藏]");
+function parseIcsBlock(block) {
+  const out = {};
+  for (const line of block.split(/\r?\n/)) {
+    const i = line.indexOf(':'); if (i < 0) continue;
+    const key = line.slice(0, i).split(';')[0].toUpperCase();
+    if (['DTSTART', 'SUMMARY', 'DESCRIPTION'].includes(key)) out[key] = decodeIcsText(line.slice(i + 1));
   }
-
-  return result;
+  return out;
 }
+function decodeIcsText(value) { return String(value).replace(/\\[nN]/g, '\n').replace(/\\,/g, ',').replace(/\\;/g, ';').replace(/\\\\/g, '\\').trim(); }
 
-function containsCoordinate(line) {
-  return /(?:^|[^\d])[-+]?(?:[1-8]?\d(?:\.\d{3,})?|90(?:\.0+)?)\s*[,;_]\s*[-+]?(?:(?:1[0-7]\d|[1-9]?\d)(?:\.\d{3,})?|180(?:\.0+)?)(?:[^\d]|$)/.test(
-    line,
-  );
-}
-
-function looksLikeStreetAddress(line) {
-  return /(?:\d{3,6}\s*)?.*(?:路|街|巷|弄|號|号)\s*\d*/.test(line);
-}
-
-function dedupeLines(text) {
-  const seen = new Set();
-  const result = [];
-
-  for (const line of String(text).split("\n")) {
-    const key = line.trim();
-    if (!key || seen.has(key)) continue;
+function parseWeatherSlots(text) {
+  const lines = String(text).replace(/\r/g, '').replace(/[‐‑‒–—−]/g, '-').replace(/\u00a0/g, ' ').split('\n').map((s) => s.trim()).filter(Boolean);
+  const slots = [], seen = new Set();
+  const patterns = [/(?:^|\s)(\d{1,2})\s*h?\s*-\s*(\d{1,2})\s*h?\s*[:：]\s*(.+)$/i, /(?:^|\s)(\d{1,2})\s*[:：]00\s*-\s*(\d{1,2})\s*[:：]00\s*[:：]?\s*(.+)$/i];
+  for (const line of lines) {
+    let match; for (const p of patterns) { match = line.match(p); if (match) break; }
+    if (!match) continue;
+    const start = Number(match[1]), end = Number(match[2]);
+    if (start < 0 || start > 23 || end < 1 || end > 24) continue;
+    const key = `${start}-${end}`; if (seen.has(key)) continue;
+    const detail = match[3].trim();
+    const tempMatch = detail.match(/(-?\d+(?:\.\d+)?)\s*°?\s*C/i);
+    const temp = tempMatch ? Number(tempMatch[1]) : null;
+    slots.push({ start, end, detail, temp, rain: isRainText(detail), thunder: /⛈|雷|thunder/i.test(detail), snow: /❄|雪|snow/i.test(detail) });
     seen.add(key);
-    result.push(key);
   }
-
-  return result.join("\n");
+  return slots.sort((a, b) => a.start - b.start).slice(0, 8);
 }
+function isRainText(text) { return /🌦|🌧|⛈|☔|💧|雨|阵雨|陣雨|雷雨|rain|shower|drizzle|storm/i.test(text); }
 
-function safeErrorMessage(error) {
-  const message = error instanceof Error ? error.message : "未知错误";
-
-  return String(message)
-    .replace(/(?:https?|webcal):\/\/\S+/gi, "[已隐藏地址]")
-    .replace(
-      /[-+]?\d{1,3}(?:\.\d{3,})?\s*[,;_]\s*[-+]?\d{1,3}(?:\.\d{3,})?/g,
-      "[已隐藏坐标]",
-    )
-    .replace(/[\r\n]+/g, " ")
-    .slice(0, 180);
+function analyzeWeather(slots) {
+  const temps = slots.map((s) => s.temp).filter(Number.isFinite);
+  const min = temps.length ? Math.min(...temps) : null, max = temps.length ? Math.max(...temps) : null;
+  const rainSlots = slots.filter((s) => s.rain), thunder = slots.some((s) => s.thunder), snow = slots.some((s) => s.snow);
+  const rainPeriods = [...new Set(rainSlots.map((s) => periodName(s.start)))];
+  const coldPeriods = [...new Set(slots.filter((s) => Number.isFinite(s.temp) && s.temp <= WEATHER_LIMITS.veryCold).map((s) => periodName(s.start)))];
+  const concerns = [];
+  if (thunder) concerns.push(WEATHER_TEXT.thunder);
+  else if (snow) concerns.push(WEATHER_TEXT.snow);
+  else if (rainSlots.length >= 6) concerns.push(WEATHER_TEXT.rainMostDay);
+  else if (rainSlots.length >= 3) concerns.push(WEATHER_TEXT.rainSeveral({ periods: joinPeriods(rainPeriods) }));
+  else if (rainPeriods.length === 1) concerns.push({凌晨:WEATHER_TEXT.rainNight,上午:WEATHER_TEXT.rainMorning,下午:WEATHER_TEXT.rainAfternoon,晚上:WEATHER_TEXT.rainEvening}[rainPeriods[0]]);
+  else if (rainPeriods.length > 1) concerns.push(WEATHER_TEXT.rainMixed({ periods: joinPeriods(rainPeriods) }));
+  if (Number.isFinite(max) && max >= WEATHER_LIMITS.veryHot) concerns.push(WEATHER_TEXT.veryHot({ max }));
+  else if (Number.isFinite(max) && max >= WEATHER_LIMITS.hot) concerns.push(WEATHER_TEXT.hot({ max }));
+  if (Number.isFinite(min) && min <= WEATHER_LIMITS.veryCold) concerns.push(WEATHER_TEXT.veryCold({ min, periods: coldPeriods.length ? joinPeriods(coldPeriods) : '部分时段' }));
+  else if (Number.isFinite(min) && min <= WEATHER_LIMITS.cold) concerns.push(WEATHER_TEXT.cold({ min, periods: periodForMin(slots, min) }));
+  else if (Number.isFinite(min) && min <= WEATHER_LIMITS.cool) concerns.push(WEATHER_TEXT.cool({ min, periods: periodForMin(slots, min) }));
+  if (Number.isFinite(min) && Number.isFinite(max) && max - min >= WEATHER_LIMITS.largeDifference) concerns.push(WEATHER_TEXT.largeDifference({ min, max }));
+  if (!concerns.length) concerns.push(APP_CONFIG.noWeatherText);
+  return { min, max, rainCount: rainSlots.length, rainPeriods, thunder, snow, concerns };
 }
+function periodName(start) { if (start < 6) return '凌晨'; if (start < 12) return '上午'; if (start < 18) return '下午'; return '晚上'; }
+function joinPeriods(periods) { return periods.join('、'); }
+function periodForMin(slots, min) { return joinPeriods([...new Set(slots.filter((s) => s.temp === min).map((s) => periodName(s.start)))]) || '部分时段'; }
 
-function securityHeaders(extra = {}) {
-  return {
-    "X-Content-Type-Options": "nosniff",
-    "X-Frame-Options": "DENY",
-    "Referrer-Policy": "no-referrer",
-    "Permissions-Policy": "geolocation=(), camera=(), microphone=()",
-    "Cross-Origin-Opener-Policy": "same-origin",
-    "Cross-Origin-Resource-Policy": "same-origin",
-    "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
-    Pragma: "no-cache",
-    Expires: "0",
-    "X-Robots-Tag": "noindex, nofollow, noarchive, nosnippet",
-    ...extra,
-  };
+function getHolidayState(date, timeZone) {
+  const p = localParts(date, timeZone), current = new Date(Date.UTC(p.year, p.month - 1, p.day));
+  const summerStart = new Date(Date.UTC(p.year, SUMMER_HOLIDAY.startMonth - 1, SUMMER_HOLIDAY.startDay));
+  const summerEnd = new Date(Date.UTC(p.year, SUMMER_HOLIDAY.endMonth - 1, SUMMER_HOLIDAY.endDay));
+  if (current >= summerStart && current <= summerEnd) return { isHoliday: true, type: '暑假' };
+  const cny = CHINESE_NEW_YEAR_DAY_1[p.year];
+  if (cny) {
+    const [y,m,d] = cny.split('-').map(Number), cnyDate = new Date(Date.UTC(y,m-1,d));
+    if (current >= addUtcDays(cnyDate,-7) && current <= addUtcDays(cnyDate,9)) return { isHoliday: true, type: '寒假' };
+  }
+  return { isHoliday: false, type: '' };
 }
-
-function textResponse(body, status = 200, extraHeaders = {}) {
-  return new Response(body, {
-    status,
-    headers: securityHeaders({
-      "Content-Type": "text/plain; charset=utf-8",
-      ...extraHeaders,
-    }),
-  });
+function buildWeatherText(result) { return [APP_CONFIG.weatherLead, ...result.slots.map(formatSlot), APP_CONFIG.weatherTail, '', APP_CONFIG.concernTitle, ...result.analysis.concerns].join('\n').slice(0, MAX_OUTPUT_CHARS); }
+function buildDailyText(result) {
+  const p = localParts(result.now, result.timeZone), weekday = WEEKDAY_TEXT[p.weekday];
+  const useHolidayLine = result.holiday.isHoliday && (p.weekday === 3 || p.weekday === 4);
+  return [APP_CONFIG.greeting, APP_CONFIG.timeLead, `〖${p.year}年${p.month}月${p.day}日 ${p.period}${p.hour12}:${String(p.minute).padStart(2,'0')}〗${APP_CONFIG.timeTail}`, buildWeatherText(result), weekday.title, weekday.line2, useHolidayLine ? weekday.holidayLine : weekday.schoolLine, weekday.line4, weekday.face].join('\n').slice(0, MAX_OUTPUT_CHARS);
 }
+function formatSlot(slot) { return `${String(slot.start).padStart(2,' ')}h - ${String(slot.end).padStart(2,' ')}h:${slot.detail}`; }
 
-function htmlResponse(body) {
-  return new Response(body, {
-    status: 200,
-    headers: securityHeaders({
-      "Content-Type": "text/html; charset=utf-8",
-      "Content-Security-Policy":
-        "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; object-src 'none'",
-    }),
-  });
+function renderPrivatePage(defaultView) {
+  const title = defaultView === 'weather' ? '私人天气' : '私人每日早安', endpoint = defaultView === 'weather' ? '/api/weather' : '/api/daily';
+  return `<!doctype html><html lang="zh-Hans"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${title}</title><meta name="robots" content="noindex,nofollow"><style>body{font-family:-apple-system,BlinkMacSystemFont,"PingFang SC",sans-serif;background:#0b0b0b;color:#eee;margin:0;padding:24px}main{max-width:900px;margin:auto}input,button{font-size:16px;padding:12px;border-radius:10px;border:1px solid #555}input{width:min(100%,560px);box-sizing:border-box;background:#171717;color:#fff}button{margin-top:12px;cursor:pointer}pre{white-space:pre-wrap;line-height:1.7;font-size:18px;background:#151515;padding:18px;border-radius:14px;min-height:120px}.nav a{color:#9ecbff;margin-right:16px}</style></head><body><main><h1>${title}</h1><p class="nav"><a href="/daily">完整早安</a><a href="/weather">天气检查</a></p><p>输入私人访问密码后读取；密码只保存在当前标签页，关闭后消失。</p><input id="token" type="password" autocomplete="off" placeholder="ACCESS_TOKEN"><br><button id="load">读取内容</button><pre id="output">等待读取……</pre><script>const t=document.getElementById('token'),o=document.getElementById('output');t.value=sessionStorage.getItem('weatherToken')||'';document.getElementById('load').onclick=async()=>{sessionStorage.setItem('weatherToken',t.value);o.textContent='读取中……';try{const r=await fetch('${endpoint}',{headers:{Authorization:'Bearer '+t.value},cache:'no-store'});o.textContent=await r.text()}catch(e){o.textContent='读取失败：'+e.message}};</script></main></body></html>`;
 }
-
-function responseWithoutBody(response) {
-  return new Response(null, {
-    status: response.status,
-    statusText: response.statusText,
-    headers: response.headers,
-  });
-}
-
-function renderPrivatePage() {
-  return `<!doctype html>
-<html lang="zh-Hans">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="robots" content="noindex,nofollow,noarchive,nosnippet">
-  <meta name="referrer" content="no-referrer">
-  <title>${PAGE_TITLE}</title>
-  <style>
-    :root { color-scheme: dark; }
-    * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      min-height: 100vh;
-      padding: 24px 16px;
-      font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif;
-      background: #0b0b0b;
-      color: #e8e8e8;
-    }
-    main { width: min(760px, 100%); margin: 0 auto; }
-    h1 { margin: 0 0 16px; font-size: 25px; }
-    .panel {
-      padding: 18px;
-      border: 1px solid #333;
-      border-radius: 14px;
-      background: #151515;
-    }
-    label { display: block; margin-bottom: 8px; }
-    input, button {
-      width: 100%;
-      min-height: 46px;
-      border-radius: 10px;
-      font: inherit;
-    }
-    input {
-      border: 1px solid #555;
-      padding: 10px 12px;
-      background: #080808;
-      color: #fff;
-    }
-    button {
-      margin-top: 12px;
-      border: 0;
-      padding: 10px 14px;
-      font-weight: 700;
-      cursor: pointer;
-    }
-    button:disabled { cursor: wait; opacity: .65; }
-    .secondary {
-      background: transparent;
-      color: #bbb;
-      border: 1px solid #444;
-    }
-    #weather {
-      display: none;
-      margin-top: 16px;
-      padding: 18px;
-      border: 1px solid #333;
-      border-radius: 14px;
-      background: #111;
-      white-space: pre-wrap;
-      line-height: 1.75;
-      font-size: 20px;
-      word-break: break-word;
-    }
-    #status { margin-top: 12px; color: #bbb; min-height: 1.5em; }
-    .note { margin-top: 12px; color: #999; font-size: 14px; line-height: 1.6; }
-  </style>
-</head>
-<body>
-  <main>
-    <h1>私人天气</h1>
-    <section class="panel" id="loginPanel">
-      <label for="token">私人访问密码</label>
-      <input id="token" type="password" autocomplete="current-password" placeholder="输入部署时设置的 ACCESS_TOKEN">
-      <button id="loadButton" type="button">查看今天的天气</button>
-      <button id="forgetButton" class="secondary" type="button">清除本标签页保存的密码</button>
-      <div id="status" role="status" aria-live="polite"></div>
-      <div class="note">密码只保存在当前浏览器标签页；关闭标签页后会清除。密码和天气订阅链接都不会写进网址。</div>
-    </section>
-    <pre id="weather" aria-live="polite"></pre>
-  </main>
-  <script>
-    const tokenInput = document.getElementById('token');
-    const loadButton = document.getElementById('loadButton');
-    const forgetButton = document.getElementById('forgetButton');
-    const statusEl = document.getElementById('status');
-    const weatherEl = document.getElementById('weather');
-
-    try {
-      const saved = sessionStorage.getItem('private_weather_token');
-      if (saved) tokenInput.value = saved;
-    } catch {}
-
-    async function loadWeather() {
-      const token = tokenInput.value.trim();
-      if (!token) {
-        statusEl.textContent = '请先输入私人访问密码。';
-        return;
-      }
-
-      loadButton.disabled = true;
-      statusEl.textContent = '正在读取天气……';
-      weatherEl.style.display = 'none';
-
-      try {
-        const response = await fetch('/api/today', {
-          method: 'GET',
-          headers: { Authorization: 'Bearer ' + token },
-          cache: 'no-store',
-          credentials: 'omit',
-          referrerPolicy: 'no-referrer'
-        });
-        const text = await response.text();
-        if (!response.ok) throw new Error(text);
-        try { sessionStorage.setItem('private_weather_token', token); } catch {}
-        weatherEl.textContent = text;
-        weatherEl.style.display = 'block';
-        statusEl.textContent = '';
-      } catch (error) {
-        statusEl.textContent = error.message || '读取失败';
-      } finally {
-        loadButton.disabled = false;
-      }
-    }
-
-    loadButton.addEventListener('click', loadWeather);
-    forgetButton.addEventListener('click', () => {
-      try { sessionStorage.removeItem('private_weather_token'); } catch {}
-      tokenInput.value = '';
-      weatherEl.textContent = '';
-      weatherEl.style.display = 'none';
-      statusEl.textContent = '已清除。';
-      tokenInput.focus();
-    });
-    tokenInput.addEventListener('keydown', (event) => {
-      if (event.key === 'Enter') loadWeather();
-    });
-  </script>
-</body>
-</html>`;
-}
+function buildPreviewSamples() { return { note:'这是格式预览，不是实时天气。', weather:`${APP_CONFIG.weatherLead}\n 0h -  3h:☁️ 🌡27°C\n 3h -  6h:🌦 🌡27°C 💧\n 6h -  9h:🌥 🌡28°C\n 9h - 12h:🌦 🌡29°C 💧\n12h - 15h:🌦 🌡33°C 💧\n15h - 18h:🌥 🌡34°C\n18h - 21h:☁️ 🌡29°C\n21h - 24h:☁️ 🌡27°C\n${APP_CONFIG.weatherTail}\n\n${APP_CONFIG.concernTitle}\n今天上午、下午可能会下雨噢，菜菜出门记得带伞啦喂。\n今天会比较热欸，菜菜记得多喝水。`, holidayWednesday:[WEEKDAY_TEXT[3].title,WEEKDAY_TEXT[3].line2,WEEKDAY_TEXT[3].holidayLine,WEEKDAY_TEXT[3].line4,WEEKDAY_TEXT[3].face].join('\n'), schoolWednesday:[WEEKDAY_TEXT[3].title,WEEKDAY_TEXT[3].line2,WEEKDAY_TEXT[3].schoolLine,WEEKDAY_TEXT[3].line4,WEEKDAY_TEXT[3].face].join('\n') }; }
+function resolveNow(dateOverride) { if (!dateOverride) return new Date(); if (!/^\d{4}-\d{2}-\d{2}$/.test(dateOverride)) throw httpError(400,'date测试参数必须是 YYYY-MM-DD'); const d=new Date(`${dateOverride}T04:00:00Z`); if(Number.isNaN(d.getTime())) throw httpError(400,'date测试参数无效'); return d; }
+function localParts(date,timeZone){const parts=new Intl.DateTimeFormat('zh-TW',{timeZone,year:'numeric',month:'numeric',day:'numeric',weekday:'short',hour:'numeric',minute:'2-digit',hour12:true}).formatToParts(date);const m=Object.fromEntries(parts.map(x=>[x.type,x.value]));const wm={'週日':0,'周日':0,'星期日':0,'週一':1,'周一':1,'星期一':1,'週二':2,'周二':2,'星期二':2,'週三':3,'周三':3,'星期三':3,'週四':4,'周四':4,'星期四':4,'週五':5,'周五':5,'星期五':5,'週六':6,'周六':6,'星期六':6};return{year:Number(m.year),month:Number(m.month),day:Number(m.day),weekday:wm[m.weekday]??date.getUTCDay(),hour12:Number(m.hour)||12,minute:Number(m.minute),period:/下午|晚上/.test(m.dayPeriod||'')?'下午':'上午'};}
+function formatDateKey(date,timeZone){const p=localParts(date,timeZone);return`${p.year}-${String(p.month).padStart(2,'0')}-${String(p.day).padStart(2,'0')}`;}
+function eventDateKey(rawValue,timeZone){const raw=String(rawValue||'').trim();if(/^\d{8}$/.test(raw))return`${raw.slice(0,4)}-${raw.slice(4,6)}-${raw.slice(6,8)}`;const m=raw.match(/^(\d{8})T(\d{6})(Z|[+-]\d{4})?$/);if(!m)return'';if(!m[3])return`${m[1].slice(0,4)}-${m[1].slice(4,6)}-${m[1].slice(6,8)}`;const z=m[3]==='Z'?'Z':`${m[3].slice(0,3)}:${m[3].slice(3)}`;const iso=`${m[1].slice(0,4)}-${m[1].slice(4,6)}-${m[1].slice(6,8)}T${m[2].slice(0,2)}:${m[2].slice(2,4)}:${m[2].slice(4,6)}${z}`;const d=new Date(iso);return Number.isNaN(d.getTime())?'':formatDateKey(d,timeZone);}
+function normalizeTimeZone(value){try{new Intl.DateTimeFormat('en',{timeZone:value}).format();return value}catch{throw new Error('TIME_ZONE设置不正确')}}
+function addUtcDays(date,days){const d=new Date(date);d.setUTCDate(d.getUTCDate()+days);return d;}
+function redactSourceSecrets(text,sourceUrl){let out=String(text);const segments=sourceUrl.pathname.split('/').filter(Boolean).slice(1,3);for(const s of segments){let decoded=s;try{decoded=decodeURIComponent(s)}catch{}for(const f of[s,decoded,decoded.replace('_',','),decoded.replace('_',', ')])if(f&&f.length>=4)out=out.split(f).join('[位置已隐藏]')}return out.replace(/(?:https?|webcal):\/\/\S+/gi,'[链接已隐藏]').replace(/[-+]?\d{1,3}(?:\.\d{3,})?\s*[,;_]\s*[-+]?\d{1,3}(?:\.\d{3,})?/g,'[坐标已隐藏]');}
+function securityHeaders(extra={}){return{'X-Content-Type-Options':'nosniff','X-Frame-Options':'DENY','Referrer-Policy':'no-referrer','Permissions-Policy':'geolocation=(), camera=(), microphone=()','Cache-Control':'no-store, no-cache, must-revalidate, max-age=0','X-Robots-Tag':'noindex, nofollow, noarchive',...extra};}
+function textResponse(body,status=200,extra={}){return new Response(body,{status,headers:securityHeaders({'Content-Type':'text/plain; charset=utf-8',...extra})});}
+function htmlResponse(body){return new Response(body,{headers:securityHeaders({'Content-Type':'text/html; charset=utf-8'})});}
+function jsonResponse(obj){return new Response(JSON.stringify(obj,null,2),{headers:securityHeaders({'Content-Type':'application/json; charset=utf-8'})});}
+function responseWithoutBody(response){return new Response(null,{status:response.status,headers:response.headers});}
+function httpError(status,message){const e=new Error(message);e.status=status;return e;}
+function safeErrorMessage(error){return String(error instanceof Error?error.message:'未知错误').replace(/(?:https?|webcal):\/\/\S+/gi,'[已隐藏地址]').replace(/[\r\n]+/g,' ').slice(0,220);}
